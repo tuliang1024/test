@@ -402,7 +402,6 @@ $$
 - $c_s$：原始 Key-Value Cache Entry。
 - $\mathrm{Top\text{-}k}(I_{t,:})$：根据 Query Token $t$ 对所有历史 Token 的相关性得分，选择得分最高的 $k$ 个 Token。
 
-
 #### DSA整体过程
 
 如下图所示,DSA的计算过程可分为MLAProlog、IndexerProlog、Lightning Indexer、Sparse Flash Attention、MLAEpilog五部分。
@@ -412,3 +411,45 @@ $$
 </p>
 
 ![1785742065154](image/MLA_1/1785742065154.jpg)
+
+
+## Test
+
+#### MLA Naive Vs Absorb
+
+在Prefill阶段，以1 Batch 64K推理为例，Lightning Indexer为每个`q_token`选择TopK=2048个`kv_token`，MLA的计算流程可以有三种选择：
+
+  **方案一：** MLA Naive + Sparse Mask，Prefill MLA使用Naive模式。每个`q_token`和所有的历史`kv_token`计算Attention，仅在`softmax`前通过Attention Mask将不属于TopK的`token`过滤掉。Attention中的两个`batch_matmul`的Shape如下：
+
+|   方案一   | Batch |  M  |  K  |  N  |
+| :---------: | :---: | :-: | :-: | :-: |
+| BMM1(Q*K^T) | 1*128 | 64K | 192 | 64K |
+|  BMM2(P*V)  | 1*128 | 64K | 64K | 128 |
+
+  该方案计算量和原始的Full Attention一致，但是无法拿到DSA的稀疏计算收益，长序列场景下性能不佳。
+
+  **方案二：** MLA Naive + Sparse Attention，Prefill MLA使用Naive模式，每个`q_token`与TopK=2048个`kv_token`计算Attention。因为每个`q_token`独立选择自己要进行计算的2048组KV，所以序列长度64k要外提到Batch轴，M轴大小为1。
+
+|   方案二   |   Batch   | M |  K  |  N  |
+| :---------: | :--------: | :-: | :--: | :--: |
+| BMM1(Q*K^T) | 1\*64K*128 | 1 | 192 | 2048 |
+|  BMM2(P*V)  | 1\*64K*128 | 1 | 2048 | 128 |
+
+  方案二的优点在于BMM的计算量较小，相对原始的Full Attention计算量降为2048/64K=1/32，但是存在以下问题：
+
+- BMM的M轴为1，矩阵乘法计算效率较低。
+- BMM对kv的HBM访存量相较原始的Full Attention激增`topk=2048`倍，将会面临访存瓶颈。
+
+  **方案三：** MLA Absorb + Sparse Attention，Prefill MLA使用Absorb模式，与Decode保持一致。同样地，每个`q_token`与TopK=2048个`kv_token`计算Attention。
+
+|   方案三   | Batch |  M  |  K  |  N  |
+| :---------: | :----: | :-: | :--: | :--: |
+| BMM1(Q*K^T) | 1\*64K | 128 | 576 | 2048 |
+|  BMM2(P*V)  | 1\*64K | 128 | 2048 | 512 |
+
+  方案三与方案二对比如下：
+
+- 方案三的计算量增加了3倍左右，体现在BMM1的K轴和BMM2的N轴。但其BMM的M轴为128，对于矩阵乘法更为友好。
+- 方案三享受Absorb模式本身相对于Naive模式的访存量下降，KV的HBM访存量相对方案二降低几十倍，耗时更低。
+
+综合考虑计算和访存耗时，以及长序列应用场景，本实践选择基于方案三(MLA Absorb + Sparse Attention)来完成Prefill部署，从而Prefill和Decode的MLA计算流可以归一。
