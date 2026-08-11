@@ -1,17 +1,17 @@
-# MLA 常见问题解答
+# MLA遗留问题
 
-## 案例：LongCat-2.0 中 MLA Naive 与 Absorb 的选择
+## MLA Naive 与 Absorb 的选择
 
-LongCat-2.0 在 Prefill 阶段采用 3S DSA。以 Batch Size 为 1、序列长度为 64K 的推理场景为例，Lightning Indexer 为每个 Query Token 选择 TopK=2048 个 KV Token。MLA 有以下三种实现方案。
+以 Batch Size 为 1、序列长度为 64K 的推理场景为例，Lightning Indexer 为每个 Query Token 选择 TopK=2048 个 KV Token。MLA 有以下三种实现方案。
 
 ### 方案一：MLA Naive + Sparse Mask
 
 Prefill MLA 使用 Naive 模式。每个 Query Token 与所有历史 KV Token 计算 Attention，仅在 Softmax 前通过 Attention Mask 过滤 TopK 以外的 Token。两个批量矩阵乘的 Shape 如下。
 
-| 计算 | Batch | M | K | N |
-| --- | ---: | ---: | ---: | ---: |
+| 计算            |   Batch |   M |   K |   N |
+| --------------- | ------: | --: | --: | --: |
 | BMM1（Q x K^T） | 1 x 128 | 64K | 192 | 64K |
-| BMM2（P x V） | 1 x 128 | 64K | 64K | 128 |
+| BMM2（P x V）   | 1 x 128 | 64K | 64K | 128 |
 
 该方案的计算量与 Full Attention 相同，无法获得 DSA 的稀疏计算收益，不适合长序列场景。
 
@@ -19,24 +19,24 @@ Prefill MLA 使用 Naive 模式。每个 Query Token 与所有历史 KV Token �
 
 Prefill MLA 使用 Naive 模式，每个 Query Token 仅与 TopK=2048 个 KV Token 计算 Attention。由于每个 Query Token 独立选择 KV Token，序列长度 64K 被外提到 Batch 轴，BMM 的 M 轴为 1。
 
-| 计算 | Batch | M | K | N |
-| --- | ---: | ---: | ---: | ---: |
-| BMM1（Q x K^T） | 1 x 64K x 128 | 1 | 192 | 2048 |
-| BMM2（P x V） | 1 x 64K x 128 | 1 | 2048 | 128 |
+| 计算            |         Batch | M |    K |    N |
+| --------------- | ------------: | -: | ---: | ---: |
+| BMM1（Q x K^T） | 1 x 64K x 128 | 1 |  192 | 2048 |
+| BMM2（P x V）   | 1 x 64K x 128 | 1 | 2048 |  128 |
 
 该方案的 BMM 计算量约为方案一的 `2048 / 64K = 1/32`，但存在两个问题：
 
 - BMM 的 M 轴为 1，矩阵乘计算效率较低。
-- 每个 Query Token、每个 Attention Head 都需要独立读取选中的 KV，KV 数据难以跨 Query 和 Head 复用，容易形成 HBM 访存瓶颈。
+- 每个 Query Token、每个 Attention Head 都需要独立读取选中的 KV，KV 数据难以跨 Query 和 Head 复用，BMM对kv的HBM访存量相较原始的Full Attention激增`topk=2048`倍，容易形成 HBM 访存瓶颈。
 
 ### 方案三：MLA Absorb + Sparse Attention
 
 Prefill MLA 使用 Absorb 模式，与 Decode 保持一致。每个 Query Token 同样只与 TopK=2048 个 KV Token 计算 Attention，但 128 个 Query Head 共享同一份 latent KV。
 
-| 计算 | Batch | M | K | N |
-| --- | ---: | ---: | ---: | ---: |
-| BMM1（Q x K^T） | 1 x 64K | 128 | 576 | 2048 |
-| BMM2（P x V） | 1 x 64K | 128 | 2048 | 512 |
+| 计算            |   Batch |   M |    K |    N |
+| --------------- | ------: | --: | ---: | ---: |
+| BMM1（Q x K^T） | 1 x 64K | 128 |  576 | 2048 |
+| BMM2（P x V）   | 1 x 64K | 128 | 2048 |  512 |
 
 与方案二相比，方案三具有以下特点：
 
@@ -59,15 +59,6 @@ Prefill MLA 使用 Absorb 模式，与 Decode 保持一致。每个 Query Token 
 = 37.65
 ```
 
-因此，按两个 BMM 的累计 HBM 读取量计算，方案三约降至方案二的 `1/37.6`。若比较 BMM 使用的逐 Head 展开 K/V 与 latent KV 表示，元素数之比为：
-
-```text
-[128 x (192 + 128)] / 576 = 71.1
-```
-
-上述 `71.1` 倍要求 RoPE Key 也按 Head 展开；若实现单独共享 RoPE Key，比例应按实际 Cache Layout 重新计算。实际收益还受算子融合、片上缓存复用、数据类型、对齐方式和 Gather 访问效率影响，因此通常表述为 KV HBM 访存量降低数十倍。
-
-综合计算量、HBM 访存量和矩阵乘效率，LongCat-2.0 选择方案三完成 Prefill 部署，并统一 Prefill 与 Decode 的 MLA 计算路径。
 
 ## FAQ 遗留问题
 
@@ -75,38 +66,19 @@ Prefill MLA 使用 Absorb 模式，与 Decode 保持一致。每个 Query Token 
 
 MLA 矩阵吸收与非吸收在数学上等价，差异在于 KV 上投影矩阵位于 Attention 的哪一侧执行。
 
-设 KV latent 为 `C`，Key 和 Value 上投影矩阵分别为 `W_UK` 和 `W_UV`。非吸收路径为：
-
-```text
-K = C x W_UK
-V = C x W_UV
-P = Softmax(Q x K^T)
-O = P x V
-```
-
-利用矩阵乘法结合律，吸收路径可改写为：
-
-```text
-Q_latent = Q x W_UK^T
-P = Softmax(Q_latent x C^T)
-O = (P x C) x W_UV
-```
-
-吸收模式将 `W_UK` 从历史 KV 侧移动到当前 Query 侧，将 `W_UV` 从历史 Value 侧移动到 Attention 输出侧，使 Attention 直接在 latent 空间完成。
-
-#### 计算量对比
+计算量对比
 
 定义：
 
-| 符号 | 含义 |
-| --- | --- |
-| `H` | Attention Head 数 |
-| `Q` | Query Token 数 |
-| `S` | KV 序列长度或每个 Query 实际选择的 KV 数 |
-| `d_c` | KV latent 维度 |
-| `d_k` | NoPE Key 维度 |
-| `d_r` | RoPE 维度 |
-| `d_v` | Value 维度 |
+| 符号    | 含义                                     |
+| ------- | ---------------------------------------- |
+| `H`   | Attention Head 数                        |
+| `Q`   | Query Token 数                           |
+| `S`   | KV 序列长度或每个 Query 实际选择的 KV 数 |
+| `d_c` | KV latent 维度                           |
+| `d_k` | NoPE Key 维度                            |
+| `d_r` | RoPE 维度                                |
+| `d_v` | Value 维度                               |
 
 忽略 Softmax、归一化和索引开销，两个 BMM 的主要计算量为：
 
@@ -213,10 +185,10 @@ AI_absorb = 128 FLOPs/Byte
 
 在 Roofline 图上，两种模式通常表现为：
 
-| 模式 | BMM Shape 特征 | 算术强度 | 常见瓶颈 |
-| --- | --- | ---: | --- |
-| Naive Sparse Attention | `M=1`，KV 按 Query、Head 独立 Gather | 低 | HBM 带宽、离散访存和矩阵乘利用率 |
-| Absorb Sparse Attention | `M=H`，各 Head 共享 latent KV | 高 | 可能从带宽受限转为计算受限 |
+| 模式                    | BMM Shape 特征                         | 算术强度 | 常见瓶颈                         |
+| ----------------------- | -------------------------------------- | -------: | -------------------------------- |
+| Naive Sparse Attention  | `M=1`，KV 按 Query、Head 独立 Gather |       低 | HBM 带宽、离散访存和矩阵乘利用率 |
+| Absorb Sparse Attention | `M=H`，各 Head 共享 latent KV        |       高 | 可能从带宽受限转为计算受限       |
 
 因此，不能仅根据 FLOPs 判断性能：
 
@@ -227,27 +199,27 @@ AI_absorb = 128 FLOPs/Byte
 
 对应到推理场景：
 
-| 场景 | Roofline 特征 | 推荐模式 |
-| --- | --- | --- |
-| 单 Token Decode、长上下文 | Query 数少，历史 KV 读取量大，Naive AI 低 | Absorb |
-| 稀疏 Prefill，KV 按 Query 独立选择 | Query 间难以复用 KV，Naive 的 `M=1` 且离散访存 | Absorb |
-| 稠密 Prefill | 同一 KV 可被多个 Query 复用，Naive AI 随 Query Block 增大 | 优先评估 Naive |
-| 短序列或 KV 可驻留片上缓存 | HBM 搬运占比下降，额外 FLOPs 更敏感 | 以实测结果为准 |
-| KV 量化 | 单元素字节数下降，两种模式的 AI 均提高 | 重新按量化数据类型计算并实测 |
+| 场景                               | Roofline 特征                                             | 推荐模式                     |
+| ---------------------------------- | --------------------------------------------------------- | ---------------------------- |
+| 单 Token Decode、长上下文          | Query 数少，历史 KV 读取量大，Naive AI 低                 | Absorb                       |
+| 稀疏 Prefill，KV 按 Query 独立选择 | Query 间难以复用 KV，Naive 的`M=1` 且离散访存           | Absorb                       |
+| 稠密 Prefill                       | 同一 KV 可被多个 Query 复用，Naive AI 随 Query Block 增大 | 优先评估 Naive               |
+| 短序列或 KV 可驻留片上缓存         | HBM 搬运占比下降，额外 FLOPs 更敏感                       | 以实测结果为准               |
+| KV 量化                            | 单元素字节数下降，两种模式的 AI 均提高                    | 重新按量化数据类型计算并实测 |
 
 实际选型时，应从 Profiling 数据获得 `FLOPs`、`HBM Bytes`、有效带宽和计算利用率，再与目标硬件对应数据类型的 `AI_ridge` 比较。稀疏 Gather 通常无法达到连续读取的峰值带宽，因此应使用实测 `BW_eff`，不能直接代入硬件标称带宽。
 
 #### 选型建议
 
-| 场景 | 推荐模式 | 主要原因 |
-| --- | --- | --- |
-| 单 Token Decode、长上下文或大 Batch Decode | Absorb | 避免展开历史 K/V，显著降低 KV Cache 读取量 |
-| MTP Decode，且 Query 数远小于 KV 长度 | Absorb | 多个 Query 仍可复用 latent KV，访存收益通常占优 |
-| 稀疏 Prefill，TopK KV 按 Query 独立选择 | Absorb | 可跨 Head 共享 latent KV，并将 Head 维放入 BMM 的 M 轴 |
-| 稠密长序列 Prefill | 优先评估 Naive | Naive 的 Attention 维度更小，理论计算量更低 |
-| 短序列、低 Batch | 以实测结果为准 | KV 搬运收益有限，额外投影和算子调度可能抵消收益 |
-| Absorb 算子不支持目标维度、布局或量化模式 | Naive | 首先保证算子兼容性和精度正确性 |
-| 需要统一 Prefill 与 Decode 路径 | 优先评估 Absorb | 可降低工程复杂度，但必须验证 Prefill 计算开销 |
+| 场景                                       | 推荐模式        | 主要原因                                               |
+| ------------------------------------------ | --------------- | ------------------------------------------------------ |
+| 单 Token Decode、长上下文或大 Batch Decode | Absorb          | 避免展开历史 K/V，显著降低 KV Cache 读取量             |
+| MTP Decode，且 Query 数远小于 KV 长度      | Absorb          | 多个 Query 仍可复用 latent KV，访存收益通常占优        |
+| 稀疏 Prefill，TopK KV 按 Query 独立选择    | Absorb          | 可跨 Head 共享 latent KV，并将 Head 维放入 BMM 的 M 轴 |
+| 稠密长序列 Prefill                         | 优先评估 Naive  | Naive 的 Attention 维度更小，理论计算量更低            |
+| 短序列、低 Batch                           | 以实测结果为准  | KV 搬运收益有限，额外投影和算子调度可能抵消收益        |
+| Absorb 算子不支持目标维度、布局或量化模式  | Naive           | 首先保证算子兼容性和精度正确性                         |
+| 需要统一 Prefill 与 Decode 路径            | 优先评估 Absorb | 可降低工程复杂度，但必须验证 Prefill 计算开销          |
 
 总体原则如下：
 
@@ -298,11 +270,11 @@ Absorb 将 `W_UK` 移到当前 Query 侧，将 `W_UV` 移到 Attention 输出侧
 
 DeepSeek-V3.2-Exp 引入 DSA。Lightning Indexer 为每个 Query Token 选择 TopK=2048 个 KV Token，随后执行 Sparse Flash Attention。仓内优化文档 `docs/models/deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md` 明确比较了三种 Prefill 方案：
 
-| 方案 | BMM Shape 特征 | 主要问题或收益 |
-| --- | --- | --- |
-| Naive + Sparse Mask | 仍计算 Full Attention | 无法获得稀疏计算收益 |
-| Naive + Sparse Attention | Batch 包含 Query Token 和 Head，`M=1` | 矩阵乘效率低，KV 按 Query、Head 离散读取 |
-| Absorb + Sparse Attention | Batch 只包含 Query Token，`M=128` | 各 Head 共享 latent KV，HBM 读取量显著下降 |
+| 方案                      | BMM Shape 特征                          | 主要问题或收益                             |
+| ------------------------- | --------------------------------------- | ------------------------------------------ |
+| Naive + Sparse Mask       | 仍计算 Full Attention                   | 无法获得稀疏计算收益                       |
+| Naive + Sparse Attention  | Batch 包含 Query Token 和 Head，`M=1` | 矩阵乘效率低，KV 按 Query、Head 离散读取   |
+| Absorb + Sparse Attention | Batch 只包含 Query Token，`M=128`     | 各 Head 共享 latent KV，HBM 读取量显著下降 |
 
 Naive Sparse Attention 无法像稠密 Attention 一样让一个连续 KV Block 被多个 Query 高效复用。每个 Query Token 都有独立的 TopK 索引，且逐 Head 展开的 K/V 需要分别 Gather，形成大量离散 HBM 访问。其典型 BMM Shape 为：
 
@@ -346,12 +318,12 @@ Absorb 主 KV 读取量约降至 1/37.6
 
 #### 结论
 
-| 模型与阶段 | Attention 形态 | 主要瓶颈 | 选择 |
-| --- | --- | --- | --- |
-| DeepSeek-R1 Prefill | 稠密 Full Attention | 大规模 BMM 计算 | Naive，降低 Attention 维度和 FLOPs |
-| DeepSeek-R1 Decode | 单/少量 Query 读取长历史 KV | KV Cache 容量与 HBM 带宽 | Absorb，避免展开历史 K/V |
-| DeepSeek-V3.2-Exp Prefill | 每个 Query 独立 TopK 的 Sparse Attention | 离散 KV Gather、`M=1` 和低算术强度 | Absorb，以更多计算换取更少搬运 |
-| DeepSeek-V3.2-Exp Decode | Sparse Attention 读取长历史 latent KV | KV 搬运与稀疏访问 | Absorb |
+| 模型与阶段                | Attention 形态                           | 主要瓶颈                             | 选择                               |
+| ------------------------- | ---------------------------------------- | ------------------------------------ | ---------------------------------- |
+| DeepSeek-R1 Prefill       | 稠密 Full Attention                      | 大规模 BMM 计算                      | Naive，降低 Attention 维度和 FLOPs |
+| DeepSeek-R1 Decode        | 单/少量 Query 读取长历史 KV              | KV Cache 容量与 HBM 带宽             | Absorb，避免展开历史 K/V           |
+| DeepSeek-V3.2-Exp Prefill | 每个 Query 独立 TopK 的 Sparse Attention | 离散 KV Gather、`M=1` 和低算术强度 | Absorb，以更多计算换取更少搬运     |
+| DeepSeek-V3.2-Exp Decode  | Sparse Attention 读取长历史 latent KV    | KV 搬运与稀疏访问                    | Absorb                             |
 
 归根结底，R1 与 V3.2-Exp 的差异来自 Prefill Attention 的数据复用模式：R1 的稠密 Prefill 能够有效复用完整 K/V，Naive 更有利于降低 FLOPs；V3.2-Exp 的稀疏 Prefill 按 Query 独立选择 KV，Naive 会失去跨 Query、跨 Head 的数据复用，Absorb 更符合其 Roofline 特征。
 
@@ -412,11 +384,11 @@ Full Attention 的大规模 BMM 与全量 KV 搬运
 
 仓内文档给出了 64K 序列、4 Batch 下的估算：
 
-| 模块 | 模式 | KV 搬运量 | Cube 计算量 | `QK^T` 搬运量 |
-| --- | --- | ---: | ---: | ---: |
-| MLA | 非 MTP | 144 MB | 19.33 GFLOPs | 32 MB |
-| SFA | 非 MTP | 4.5 MB | 0.60 GFLOPs | 1 MB |
-| LI | 非 MTP | 32 MB | 2.15 GFLOPs | 16 MB |
+| 模块 | 模式   | KV 搬运量 |  Cube 计算量 | `QK^T` 搬运量 |
+| ---- | ------ | --------: | -----------: | --------------: |
+| MLA  | 非 MTP |    144 MB | 19.33 GFLOPs |           32 MB |
+| SFA  | 非 MTP |    4.5 MB |  0.60 GFLOPs |            1 MB |
+| LI   | 非 MTP |     32 MB |  2.15 GFLOPs |           16 MB |
 
 相较稠密 MLA，SFA 的 KV 搬运量由 144 MB 降至 4.5 MB，Cube 计算量由 19.33 GFLOPs 降至 0.60 GFLOPs；但 LI 仍需搬运 32 MB 的 Indexer Key，并执行 2.15 GFLOPs 计算。因此，主 Attention 被稀疏化后，LI 的耗时占比自然上升。该对比反映的是模型化的模块开销，不代表各模块耗时可按数值直接线性换算；TopK 和离散 Gather 的实际效率还取决于算子实现与有效 HBM 带宽。
 
@@ -431,14 +403,14 @@ LI 还为 KVCache Offload 提供了选择依据。仓内实现使用 LI 返回�
 
 #### 结论
 
-| 影响项 | 部署 LI 前 | 部署 LI 后 |
-| --- | --- | --- |
-| 主 Attention | 扫描并计算全量 KV | SFA 仅计算 TopK KV |
-| 长序列 Prefill 瓶颈 | Full Attention BMM 与 KV 搬运 | LI 的 `S^2` 打分、ReduceSum 和 TopK |
-| 长序列 Decode 瓶颈 | 全量 KV 读取与 Attention 计算 | LI 全序列扫描与 SFA 离散 Gather |
-| 并行策略 | 主要围绕 Attention 计算切分 | LI 的 Head 归约使 Prefill 更适合 CP |
-| Cache | MLA KVCache | MLA KVCache 与 Indexer Key Cache |
-| 整网热点 | Attention 占比较高 | MoE、MatMul 和 Epilog 相对占比提高 |
+| 影响项              | 部署 LI 前                    | 部署 LI 后                           |
+| ------------------- | ----------------------------- | ------------------------------------ |
+| 主 Attention        | 扫描并计算全量 KV             | SFA 仅计算 TopK KV                   |
+| 长序列 Prefill 瓶颈 | Full Attention BMM 与 KV 搬运 | LI 的`S^2` 打分、ReduceSum 和 TopK |
+| 长序列 Decode 瓶颈  | 全量 KV 读取与 Attention 计算 | LI 全序列扫描与 SFA 离散 Gather      |
+| 并行策略            | 主要围绕 Attention 计算切分   | LI 的 Head 归约使 Prefill 更适合 CP  |
+| Cache               | MLA KVCache                   | MLA KVCache 与 Indexer Key Cache     |
+| 整网热点            | Attention 占比较高            | MoE、MatMul 和 Epilog 相对占比提高   |
 
 总体而言，LI 使用较轻的全序列筛选换取主 Attention 的 TopK 稀疏化。它显著降低了长序列 SFA 的计算量和 KV 搬运量，但将性能瓶颈转移到 LI 的全序列打分与 TopK、SFA 的离散 Gather，以及 Attention 之外的 MoE 和 MatMul。仓内 128K Benchmark 中 DeepSeek-V3.2-Exp 吞吐达到 DeepSeek-V3.1 的 450%，这是 DSA、融合算子、量化、并行和流水等整套优化共同作用的结果，不能视为 LI 单模块的独立收益。
 
@@ -448,17 +420,17 @@ LI 还为 KVCache Offload 提供了选择依据。仓内实现使用 LI 返回�
 
 #### 符号与默认维度
 
-| 符号 | 含义 | DeepSeek-R1 / V3.2-Exp 默认值 |
-| --- | --- | ---: |
-| `T` | 当前调用中所有 Query Token 数 | 随 Batch 和阶段变化 |
-| `H` | Hidden Size | 由模型配置决定 |
-| `N` | Attention Head 数 | 128 |
-| `N_local` | 当前 Attention TP Rank 的 Head 数 | `N / attn_tp_size` |
-| `d_c` | MLA KV latent 维度，即 `kv_lora_rank` | 512 |
-| `d_n` | 非 RoPE 的 Q/K Head 维度 | 128 |
-| `d_r` | RoPE Head 维度 | 64 |
-| `d_v` | Value Head 维度 | 128 |
-| `K_top` | V3.2-Exp 每个 Query 选择的 KV 数 | 2048 |
+| 符号        | 含义                                   | DeepSeek-R1 / V3.2-Exp 默认值 |
+| ----------- | -------------------------------------- | ----------------------------: |
+| `T`       | 当前调用中所有 Query Token 数          |           随 Batch 和阶段变化 |
+| `H`       | Hidden Size                            |                由模型配置决定 |
+| `N`       | Attention Head 数                      |                           128 |
+| `N_local` | 当前 Attention TP Rank 的 Head 数      |          `N / attn_tp_size` |
+| `d_c`     | MLA KV latent 维度，即`kv_lora_rank` |                           512 |
+| `d_n`     | 非 RoPE 的 Q/K Head 维度               |                           128 |
+| `d_r`     | RoPE Head 维度                         |                            64 |
+| `d_v`     | Value Head 维度                        |                           128 |
+| `K_top`   | V3.2-Exp 每个 Query 选择的 KV 数       |                          2048 |
 
 MLA 不缓存每个 Head 的完整 K/V，而是缓存两部分：
 
@@ -506,29 +478,29 @@ KV 路径：x -> W_DKV_KR -> 拆分 C_KV/K_rope
 
 主要输入如下：
 
-| 输入 | 典型 Shape 或类型 | 作用 |
-| --- | --- | --- |
-| `token_x` | `[T, H]`；CP Prefill 可为 `[1,T,H]` | 当前层输入 Hidden States |
-| `weight_dq` | Q 下投影权重 | 将 Hidden States 投影到 Q LoRA latent |
-| `weight_uq_qr` | Q 上投影权重 | 生成各 Head 的 Q_nope 和 Q_rope |
-| `weight_uk` | `[N_local,d_n,d_c]` 等价布局 | 将 `W_UK` 吸收到 Query 侧，使 Q_nope 映射到 `d_c` |
-| `weight_dkv_kr` | KV 下投影权重 | 同时生成 latent KV 与 RoPE Key |
-| `rmsnorm_gamma_cq` | Q latent Norm 权重 | 对 Q LoRA latent 执行 RMSNorm |
-| `rmsnorm_gamma_ckv` | `[d_c]` | 对 latent KV 执行 RMSNorm |
-| `rope_sin`、`rope_cos` | `[T,d_r]` 等价布局 | 对 Q_rope 和 K_rope 应用位置编码 |
-| `cache_index` | `[T]` | 每个新 Token 的物理写入 Slot，即 `slot_mapping` |
-| `kv_cache`、`kr_cache` | 分页缓存 Tensor | 分别保存 latent KV 和 RoPE Key |
-| 量化 Scale 与 Mode | 可选 | 控制权重、Query 和 KVCache 量化 |
+| 输入                       | 典型 Shape 或类型                       | 作用                                                 |
+| -------------------------- | --------------------------------------- | ---------------------------------------------------- |
+| `token_x`                | `[T, H]`；CP Prefill 可为 `[1,T,H]` | 当前层输入 Hidden States                             |
+| `weight_dq`              | Q 下投影权重                            | 将 Hidden States 投影到 Q LoRA latent                |
+| `weight_uq_qr`           | Q 上投影权重                            | 生成各 Head 的 Q_nope 和 Q_rope                      |
+| `weight_uk`              | `[N_local,d_n,d_c]` 等价布局          | 将`W_UK` 吸收到 Query 侧，使 Q_nope 映射到 `d_c` |
+| `weight_dkv_kr`          | KV 下投影权重                           | 同时生成 latent KV 与 RoPE Key                       |
+| `rmsnorm_gamma_cq`       | Q latent Norm 权重                      | 对 Q LoRA latent 执行 RMSNorm                        |
+| `rmsnorm_gamma_ckv`      | `[d_c]`                               | 对 latent KV 执行 RMSNorm                            |
+| `rope_sin`、`rope_cos` | `[T,d_r]` 等价布局                    | 对 Q_rope 和 K_rope 应用位置编码                     |
+| `cache_index`            | `[T]`                                 | 每个新 Token 的物理写入 Slot，即`slot_mapping`     |
+| `kv_cache`、`kr_cache` | 分页缓存 Tensor                         | 分别保存 latent KV 和 RoPE Key                       |
+| 量化 Scale 与 Mode         | 可选                                    | 控制权重、Query 和 KVCache 量化                      |
 
 主要显式输出为：
 
-| 输出 | 典型 Shape | 作用 |
-| --- | --- | --- |
-| `q_nope` | `[T,N_local,d_c]` | 已吸收 `W_UK` 的非 RoPE Query，直接与 latent KV 计算得分 |
-| `q_pe` | `[T,N_local,d_r]` | 应用 RoPE 后的 Query 位置分量 |
-| `dequant_scale_q_nope` | 与量化 Query 对应 | 量化 Attention 使用的反量化参数；非量化路径可忽略 |
-| `qr` | `[T,q_lora_rank]` | Q 下投影并归一化后的中间结果；V3.2-Exp 将其复用于 Indexer Q 投影 |
-| `dequant_q_norm` | 与量化 Q latent 对应 | Indexer 或后续量化投影使用的 Per-Token Scale |
+| 输出                     | 典型 Shape           | 作用                                                             |
+| ------------------------ | -------------------- | ---------------------------------------------------------------- |
+| `q_nope`               | `[T,N_local,d_c]`  | 已吸收`W_UK` 的非 RoPE Query，直接与 latent KV 计算得分        |
+| `q_pe`                 | `[T,N_local,d_r]`  | 应用 RoPE 后的 Query 位置分量                                    |
+| `dequant_scale_q_nope` | 与量化 Query 对应    | 量化 Attention 使用的反量化参数；非量化路径可忽略                |
+| `qr`                   | `[T,q_lora_rank]`  | Q 下投影并归一化后的中间结果；V3.2-Exp 将其复用于 Indexer Q 投影 |
+| `dequant_q_norm`       | 与量化 Q latent 对应 | Indexer 或后续量化投影使用的 Per-Token Scale                     |
 
 该算子还有一个重要的原地副作用：根据 `cache_index` 将当前 Token 的 latent KV 与 RoPE Key 写入 `kv_cache` 和 `kr_cache`。因此，仅查看 Python 返回值会遗漏 MLA Prolog 的缓存更新职责。
 
@@ -538,12 +510,12 @@ R1 未启用融合 Prolog 时使用 `npu_kv_rmsnorm_rope_cache_v2` 完成 KV 路
 
 MLA Attention 使用两个容易混淆的索引：
 
-| 输入 | 使用阶段 | 作用 |
-| --- | --- | --- |
-| `slot_mapping` / `cache_index` | MLA Prolog 或 Cache 更新算子 | 将当前 Token 写入指定物理 Slot |
-| `block_table` | FA、SFA 或 LI | 将每个请求的逻辑 KV Block 映射到物理 Block |
-| `actual_seq_lengths_q` | Attention/LI | 指明 Packed Batch 中每个请求的有效 Query 边界 |
-| `actual_seq_lengths_kv` | Attention/LI | 限制每个请求可读取的有效历史 KV 长度 |
+| 输入                               | 使用阶段                     | 作用                                          |
+| ---------------------------------- | ---------------------------- | --------------------------------------------- |
+| `slot_mapping` / `cache_index` | MLA Prolog 或 Cache 更新算子 | 将当前 Token 写入指定物理 Slot                |
+| `block_table`                    | FA、SFA 或 LI                | 将每个请求的逻辑 KV Block 映射到物理 Block    |
+| `actual_seq_lengths_q`           | Attention/LI                 | 指明 Packed Batch 中每个请求的有效 Query 边界 |
+| `actual_seq_lengths_kv`          | Attention/LI                 | 限制每个请求可读取的有效历史 KV 长度          |
 
 `slot_mapping` 只负责写入位置，`block_table` 只负责读取寻址。两者必须来自同一套分页映射，否则即使 Shape 合法，也会读到其他请求或错误位置的缓存。
 
@@ -559,15 +531,15 @@ K_rope  = 按 Head 复制 -> [N_local,T,d_r]
 
 随后调用 `npu_fused_infer_attention_score`：
 
-| 输入 | Shape/含义 |
-| --- | --- |
-| `query` | 完整 `Q_nope`，Head 维为 `d_n` |
-| `key` | 上投影后的 `K_nope` |
-| `value` | 上投影后的完整 V |
-| `query_rope`、`key_rope` | Q/K 的 `d_r` 位置分量 |
-| `atten_mask` | Prefill 因果 Mask |
-| `actual_seq_lengths*` | Packed Batch 的有效 Q/KV 长度 |
-| `scale` | `1/sqrt(d_n+d_r)`，包含 YaRN 修正时再乘 `mscale^2` |
+| 输入                         | Shape/含义                                             |
+| ---------------------------- | ------------------------------------------------------ |
+| `query`                    | 完整`Q_nope`，Head 维为 `d_n`                      |
+| `key`                      | 上投影后的`K_nope`                                   |
+| `value`                    | 上投影后的完整 V                                       |
+| `query_rope`、`key_rope` | Q/K 的`d_r` 位置分量                                 |
+| `atten_mask`               | Prefill 因果 Mask                                      |
+| `actual_seq_lengths*`      | Packed Batch 的有效 Q/KV 长度                          |
+| `scale`                    | `1/sqrt(d_n+d_r)`，包含 YaRN 修正时再乘 `mscale^2` |
 
 算子输出是逐 Head 的 Attention 结果，逻辑 Shape 为 `[T,N_local,d_v]`。模型再将其展平并通过 `o_proj`，得到 `[T,H]`。这条路径的 Attention 维度较小，但需要展开逐 Head K/V，因此适合计算量占主导的稠密 Prefill。
 
@@ -575,16 +547,16 @@ K_rope  = 按 Head 复制 -> [N_local,T,d_r]
 
 R1 的 `forward_page_attention_absorb()` 和 `forward_page_attention_mla_prolog()` 使用 `npu_fused_infer_attention_score_v2`：
 
-| 输入 | Shape/含义 |
-| --- | --- |
-| `q_nope` | `[T,N_local,d_c]`，已吸收 `W_UK` |
-| `k_nope` | latent `nope_cache`，逻辑 Head 数为 1 |
-| `value` | 与 Key 相同，仍使用 latent `nope_cache` |
-| `query_rope` | `[T,N_local,d_r]` |
-| `key_rope` | `rope_cache`，逻辑 Head 数为 1 |
-| `block_table` | 分页 KVCache 的读取映射 |
-| `actual_seq_qlen/kvlen` | 每个请求的有效 Q/KV 长度 |
-| `softmax_scale` | Attention 缩放系数 |
+| 输入                      | Shape/含义                               |
+| ------------------------- | ---------------------------------------- |
+| `q_nope`                | `[T,N_local,d_c]`，已吸收 `W_UK`     |
+| `k_nope`                | latent`nope_cache`，逻辑 Head 数为 1   |
+| `value`                 | 与 Key 相同，仍使用 latent`nope_cache` |
+| `query_rope`            | `[T,N_local,d_r]`                      |
+| `key_rope`              | `rope_cache`，逻辑 Head 数为 1         |
+| `block_table`           | 分页 KVCache 的读取映射                  |
+| `actual_seq_qlen/kvlen` | 每个请求的有效 Q/KV 长度                 |
+| `softmax_scale`         | Attention 缩放系数                       |
 
 这里 `key=value=k_nope` 并不表示数学上的 K 与 V 权重相同，而是因为两次矩阵吸收后，Attention 得分计算与 Value 加权求和都可以围绕同一份 latent KV 完成。
 
@@ -613,15 +585,15 @@ Indexer Key -> 写入 indexer_key_cache
 
 `npu_lightning_indexer` 的关键输入输出如下：
 
-| 输入 | 典型 Shape/含义 |
-| --- | --- |
-| `query` | `[T,64,128]`，Indexer Query |
-| `key` | 分页 `indexer_key_cache`，逻辑 Shape 为 `[num_blocks,block_size,1,128]` |
-| `weights` | `[T,64]`，用于聚合各 Indexer Head 的得分 |
-| `block_table` | Indexer Key Cache 的分页读取映射 |
-| `actual_seq_lengths_query/key` | 每个请求的有效 Query/Key 长度 |
-| `sparse_count` | `2048` |
-| `sparse_mode` | `3`，遵循因果可见范围 |
+| 输入                             | 典型 Shape/含义                                                            |
+| -------------------------------- | -------------------------------------------------------------------------- |
+| `query`                        | `[T,64,128]`，Indexer Query                                              |
+| `key`                          | 分页`indexer_key_cache`，逻辑 Shape 为 `[num_blocks,block_size,1,128]` |
+| `weights`                      | `[T,64]`，用于聚合各 Indexer Head 的得分                                 |
+| `block_table`                  | Indexer Key Cache 的分页读取映射                                           |
+| `actual_seq_lengths_query/key` | 每个请求的有效 Query/Key 长度                                              |
+| `sparse_count`                 | `2048`                                                                   |
+| `sparse_mode`                  | `3`，遵循因果可见范围                                                    |
 
 输出 `topk_indices` 的逻辑 Shape 为 `[T,1,2048]`，表示每个 Query 选中的历史 Token 位置。该输出不是 Attention Score，也不包含 KV 数据，只是后续 SFA 的稀疏读取索引。
 
@@ -629,16 +601,16 @@ Indexer Key -> 写入 indexer_key_cache
 
 `npu_sparse_flash_attention` 接收 Absorb Query、latent KVCache 和 LI 输出的索引：
 
-| 输入 | Shape/含义 |
-| --- | --- |
-| `query` | `q_nope [T,N_local,d_c]` |
-| `key`、`value` | 同一份 latent `nope_cache` |
-| `query_rope`、`key_rope` | Q/K 的 `d_r` 位置分量 |
-| `sparse_indices` | `[T,1,2048]`，LI 输出的 TopK 位置 |
-| `block_table` | 完整 MLA KVCache 的分页读取映射 |
-| `actual_seq_lengths_query/kv` | 每个请求的有效长度 |
-| `scale_value` | Attention 缩放系数 |
-| `layout_query/layout_kv` | `TND` / `PA_BSND` |
+| 输入                            | Shape/含义                          |
+| ------------------------------- | ----------------------------------- |
+| `query`                       | `q_nope [T,N_local,d_c]`          |
+| `key`、`value`              | 同一份 latent`nope_cache`         |
+| `query_rope`、`key_rope`    | Q/K 的`d_r` 位置分量              |
+| `sparse_indices`              | `[T,1,2048]`，LI 输出的 TopK 位置 |
+| `block_table`                 | 完整 MLA KVCache 的分页读取映射     |
+| `actual_seq_lengths_query/kv` | 每个请求的有效长度                  |
+| `scale_value`                 | Attention 缩放系数                  |
+| `layout_query/layout_kv`      | `TND` / `PA_BSND`               |
 
 算子内部先按 `sparse_indices` Gather KV，再完成 QK、Softmax 和 latent V 加权求和。Python 路径取其主输出并转置为 `[N_local,T,d_c]`，交给 MLA Epilog。C8 KVCache 场景使用 `npu_kv_quant_sparse_flash_attention`，输入还包含量化模式和 Scale，但数学输出含义相同。
 
@@ -648,11 +620,11 @@ Indexer Key -> 写入 indexer_key_cache
 
 V3.2-Exp 的 `mla_epilog(absorb=True)` 与 R1 Absorb 尾部语义一致：
 
-| 输入 | Shape/含义 |
-| --- | --- |
-| `attn_output` | `[N_local,T,d_c]`，SFA 返回的 latent 加权和 |
-| `kv_b_proj_w_v` | `[N_local,d_c,d_v]` 等价布局，即 `W_UV` |
-| `o_proj` 权重 | `[H,N*d_v]` 等价布局 |
+| 输入              | Shape/含义                                    |
+| ----------------- | --------------------------------------------- |
+| `attn_output`   | `[N_local,T,d_c]`，SFA 返回的 latent 加权和 |
+| `kv_b_proj_w_v` | `[N_local,d_c,d_v]` 等价布局，即 `W_UV`   |
+| `o_proj` 权重   | `[H,N*d_v]` 等价布局                        |
 
 处理过程为：
 
@@ -664,10 +636,10 @@ V3.2-Exp 的 `mla_epilog(absorb=True)` 与 R1 Absorb 尾部语义一致：
 
 #### 算子链路对比
 
-| 模型路径 | Prolog/缓存 | Attention | Epilog | 最终输出 |
-| --- | --- | --- | --- | --- |
-| R1 Naive Prefill | KV RMSNorm、RoPE、写 latent Cache，再展开完整 K/V | Dense FA，K/V 为逐 Head 完整表示 | `o_proj` | `[T,H]` |
-| R1 Absorb Decode | MLA Prolog 或拆分算子生成 Absorb Q，并写 latent Cache | FA v2，`key=value=latent KV` | `W_UV + o_proj` | `[T,H]` |
-| V3.2-Exp Prefill/Decode | MLA Prolog，同时生成 LI 可复用的 `qr` | LI 生成 TopK，SFA 读取稀疏 latent KV | `W_UV + o_proj` | `[T,H]` |
+| 模型路径                | Prolog/缓存                                           | Attention                            | Epilog            | 最终输出  |
+| ----------------------- | ----------------------------------------------------- | ------------------------------------ | ----------------- | --------- |
+| R1 Naive Prefill        | KV RMSNorm、RoPE、写 latent Cache，再展开完整 K/V     | Dense FA，K/V 为逐 Head 完整表示     | `o_proj`        | `[T,H]` |
+| R1 Absorb Decode        | MLA Prolog 或拆分算子生成 Absorb Q，并写 latent Cache | FA v2，`key=value=latent KV`       | `W_UV + o_proj` | `[T,H]` |
+| V3.2-Exp Prefill/Decode | MLA Prolog，同时生成 LI 可复用的`qr`                | LI 生成 TopK，SFA 读取稀疏 latent KV | `W_UV + o_proj` | `[T,H]` |
 
 从接口角度看，MLA 算子链路遵循一个稳定契约：Prolog 将 `[T,H]` 转为 Absorb Query 并更新压缩 KVCache；Attention 在 `d_c` latent 空间完成得分计算与加权求和；Epilog 再通过 `W_UV` 和 `o_proj` 恢复为 `[T,H]`。R1 与 V3.2-Exp 的主要区别在 Attention 中间阶段：前者使用稠密 FA，后者先由 LI 选出 TopK，再使用 SFA。
