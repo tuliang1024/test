@@ -412,10 +412,9 @@ $$
 
 ![1785742065154](image/MLA_1/1785742065154.jpg)
 
+## MLA遗留问题
 
-## Test
-
-#### MLA Naive Vs Absorb
+### MLA Naive Vs Absorb
 
 在Prefill阶段，以1 Batch 64K推理为例，Lightning Indexer为每个`q_token`选择TopK=2048个`kv_token`，MLA的计算流程可以有三种选择：
 
@@ -453,3 +452,62 @@ $$
 - 方案三享受Absorb模式本身相对于Naive模式的访存量下降，KV的HBM访存量相对方案二降低几十倍，耗时更低。
 
 综合考虑计算和访存耗时，以及长序列应用场景，本实践选择基于方案三(MLA Absorb + Sparse Attention)来完成Prefill部署，从而Prefill和Decode的MLA计算流可以归一。
+
+### 遗留问题
+
+#### 1. 什么时候使用矩阵吸收？什么时候使用非吸收？
+
+| 场景                                       | 推荐模式        | 主要原因                                               |
+| ------------------------------------------ | --------------- | ------------------------------------------------------ |
+| 单 Token Decode、长上下文或大 Batch Decode | Absorb          | 避免展开历史 K/V，显著降低 KV Cache 读取量             |
+| 稀疏 Prefill，TopK KV 按 Query 独立选择    | Absorb          | 可跨 Head 共享 latent KV，并将 Head 维放入 BMM 的 M 轴 |
+| 稠密长序列 Prefill                         | 优先评估 Naive  | Naive 的 Attention 维度更小，理论计算量更低            |
+| 需要统一 Prefill 与 Decode 路径            | 优先评估 Absorb | 可降低工程复杂度，但必须验证 Prefill 计算开销          |
+
+#### 2. 为什么 DeepSeek-R1 的 Prefill 使用 Naive、Decode 使用 Absorb，而 DeepSeek-V3.2-Exp 的 Prefill 和 Decode 均使用 Absorb？
+
+- DeepSeek-R1：稠密 Prefill 优先减少计算量
+- DeepSeek-R1：Decode 优先减少 KV 搬运
+- DeepSeek-V3.2-Exp 引入 DSA。Lightning Indexer 为每个 Query Token 选择 TopK=2048 个 KV Token，随后执行 Sparse Flash Attention。
+
+| 模型与阶段                | Attention 形态                           | 主要瓶颈                             | 选择                               |
+| ------------------------- | ---------------------------------------- | ------------------------------------ | ---------------------------------- |
+| DeepSeek-R1 Prefill       | 稠密 Full Attention                      | 大规模 BMM 计算                      | Naive，降低 Attention 维度和 FLOPs |
+| DeepSeek-R1 Decode        | 单/少量 Query 读取长历史 KV              | KV Cache 容量与 HBM 带宽             | Absorb，避免展开历史 K/V           |
+| DeepSeek-V3.2-Exp Prefill | 每个 Query 独立 TopK 的 Sparse Attention | 离散 KV Gather、`M=1` 和低算术强度 | Absorb，以更多计算换取更少搬运     |
+| DeepSeek-V3.2-Exp Decode  | Sparse Attention 读取长历史 latent KV    | KV 搬运与稀疏访问                    | Absorb                             |
+
+#### 3. Lightning Indexer 对整网性能有什么影响？部署 LI 后性能瓶颈如何变化？
+
+LI 将计算和搬运开销更高的主 Attention 从全量 KV 限制到固定 TopK 范围。
+
+- 权重内存分析
+
+  Lightning Indexer是一个轻量的类MQA结构，新增了**q_b proj**，**wk proj**和**weight proj**三个Linear层，其权重大小分别为：
+
+$$
+\begin{aligned}
+  \mathrm{Param}_{\mathrm{q\_b\_proj}}&=\mathrm{q\_lora\_rank}  \times \mathrm{Indexer\_head\_num} \times \mathrm{Indexer\_head\_dim} \\
+  \mathrm{Param}_{\mathrm{wk\_proj}} &= \mathrm{hidden\_size} \times \mathrm{Indexer\_head\_dim}\\
+  \mathrm{Param}_{\mathrm{weight\_proj}} &= \mathrm{hidden\_size} \times \mathrm{Indexer\_head\_num}
+  \end{aligned}
+$$
+
+  综合所有Layer，权重参数量新增**0.85B**左右。
+
+- KVCache内存分析
+
+  **新增缓存Indexer Key Cache**，其内存大小为：
+
+  $$
+  \mathrm{batch\_size}\times \mathrm{kv\_length} \times \mathrm{Indexer\_head\_dim} \times \mathrm{storage\_bytes} \times \mathrm{num\_layers}
+  $$
+
+  以每个rank处理4batch 64K序列长度为例，BF16场景新增的Indexer Key Cache约为**4GB**左右。
+
+
+LI 同时引入以下额外成本：
+
+- 每层新增 `q_b_proj`、`wk_proj` 和 `weight_proj`。
+- Decode 需要额外缓存 Indexer Key，大小为 `batch_size x kv_length x indexer_head_dim x storage_bytes x num_layers`。仓内文档给出的示例中，每个 Rank 处理 4 Batch、序列长度为 64K、使用 BF16 时，新增缓存约为 4 GB。
+- LI 包含 Score BatchMatmul、ReLU、ReduceSum 和 TopK；长序列下 TopK 成为热点。
